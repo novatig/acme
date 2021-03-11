@@ -51,7 +51,7 @@ class MDPNormalization(snt.Module):
     return output
 
   def scale_rewards(self, rewards: tf.Tensor) -> tf.Tensor:
-    output = self._ret_factor * self._ret_scale * (rewards - self._ret_mean)
+    output = self._ret_scale * (rewards - self._ret_mean)
     output = tf.stop_gradient(output)
     return output
 
@@ -66,7 +66,7 @@ class MDPNormalization(snt.Module):
 
 class SquashedGaussianValueHead(snt.Module):
   """A network with linear value layer and a scaled tanh policy layer.
-  
+
   The policy is meant to be used as mean of a Squashed Multivariate Gaussian.
   It is squashed to ensure numerical safety of the Jacobian in the probability.
   E.g. If squash_max=4, the mean ranges between -4 to 4, and the action between
@@ -87,7 +87,7 @@ class SquashedGaussianValueHead(snt.Module):
     self._squash_max = squash_max
 
   def __call__(self, inputs: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Returns (Mean-action, Value) tuple."""
+    #policy = self._policy_layer(inputs)
     policy = self._squash_max * tf.math.tanh(
         self._policy_layer(inputs) / self._squash_max)
     value = tf.squeeze(self._value_layer(inputs), axis=-1)

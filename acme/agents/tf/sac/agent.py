@@ -47,15 +47,16 @@ class SAC(agent.Agent):
                policy_network: snt.Module,
                critic_network: snt.Module,
                observation_network: types.TensorTransformation = tf.identity,
-               entropy_coeff: float = 0.1,
+               entropy_coeff: float = 0.2,
+               target_update_period: int = 0,
                discount: float = 0.99,
                batch_size: int = 256,
                prefetch_size: int = 4,
                min_replay_size: int = 10000,
-               max_replay_size: int = 1000000,
-               samples_per_insert: float = 32.0,
+               max_replay_size: int = 250000,
+               samples_per_insert: float = 64.0,
                n_step: int = 5,
-               sigma: float = 0.3,
+               sigma: float = 0.5,
                clipping: bool = True,
                logger: loggers.Logger = None,
                counter: counting.Counter = None,
@@ -118,7 +119,6 @@ class SAC(agent.Agent):
     # Get observation and action specs.
     act_spec = environment_spec.actions
     obs_spec = environment_spec.observations
-    emb_spec = tf2_utils.create_variables(observation_network, [obs_spec])
 
     # Create the behavior policy.
     sampling_head = model.SquashedGaussianSamplingHead(act_spec, sigma)
@@ -126,11 +126,25 @@ class SAC(agent.Agent):
       snt.Sequential([observation_network, policy_network]), sampling_head)
 
     # Create variables.
+    emb_spec = tf2_utils.create_variables(observation_network, [obs_spec])
     tf2_utils.create_variables(policy_network, [emb_spec])
     tf2_utils.create_variables(critic_network, [emb_spec, act_spec])
 
     # Create the actor which defines how we take actions.
     actor = actors.FeedForwardActor(behavior_network, adder=adder)
+
+    if target_update_period > 0:
+      target_policy_network = copy.deepcopy(policy_network)
+      target_critic_network = copy.deepcopy(critic_network)
+      target_observation_network = copy.deepcopy(observation_network)
+
+      tf2_utils.create_variables(target_policy_network, [emb_spec])
+      tf2_utils.create_variables(target_critic_network, [emb_spec, act_spec])
+      tf2_utils.create_variables(target_observation_network, [obs_spec])
+    else:
+      target_policy_network = policy_network
+      target_critic_network = critic_network
+      target_observation_network = observation_network
 
     # Create optimizers.
     policy_optimizer = snt.optimizers.Adam(learning_rate=1e-4)
@@ -142,8 +156,12 @@ class SAC(agent.Agent):
         critic_network=critic_network,
         sampling_head=sampling_head,
         observation_network=observation_network,
+        target_policy_network=target_policy_network,
+        target_critic_network=target_critic_network,
+        target_observation_network=target_observation_network,
         policy_optimizer=policy_optimizer,
         critic_optimizer=critic_optimizer,
+        target_update_period=target_update_period,
         clipping=clipping,
         entropy_coeff=entropy_coeff,
         discount=discount,

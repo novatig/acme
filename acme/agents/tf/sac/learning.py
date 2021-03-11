@@ -60,10 +60,14 @@ class SACLearner(acme.Learner):
       policy_network: snt.Module,
       critic_network: snt.Module,
       sampling_head: snt.Module,
+      target_policy_network: snt.Module,
+      target_critic_network: snt.Module,
       discount: float,
+      target_update_period: int,
       entropy_coeff: float,
       dataset: tf.data.Dataset,
       observation_network: types.TensorTransformation = lambda x: x,
+      target_observation_network: types.TensorTransformation = lambda x: x,
       policy_optimizer: snt.Optimizer = None,
       critic_optimizer: snt.Optimizer = None,
       clipping: bool = False,
@@ -92,10 +96,14 @@ class SACLearner(acme.Learner):
     # Store online and target networks.
     self._policy_network = policy_network
     self._critic_network = critic_network
+    self._target_policy_network = target_policy_network
+    self._target_critic_network = target_critic_network
     self._sampling_head = sampling_head
 
     # Make sure observation networks are snt.Module's so they have variables.
     self._observation_network = tf2_utils.to_sonnet_module(observation_network)
+    self._target_observation_network = tf2_utils.to_sonnet_module(
+        target_observation_network)
 
     # General learner book-keeping and loggers.
     self._counter = counter or counting.Counter()
@@ -106,6 +114,10 @@ class SACLearner(acme.Learner):
     self._clipping = clipping
     self._entropy_coeff = entropy_coeff
 
+    # Necessary to track when to update target networks.
+    self._num_steps = tf.Variable(0, dtype=tf.int32)
+    self._target_update_period = target_update_period
+
     # Create an iterator to go through the dataset.
     # TODO(b/155086959): Fix type stubs and remove.
     self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
@@ -113,6 +125,14 @@ class SACLearner(acme.Learner):
     # Create optimizers if they aren't given.
     self._policy_optimizer = policy_optimizer or snt.optimizers.Adam(1e-4)
     self._critic_optimizer = critic_optimizer or snt.optimizers.Adam(1e-4)
+
+    # Expose the variables.
+    policy_network_to_expose = snt.Sequential(
+        [self._target_observation_network, self._target_policy_network])
+    self._variables = {
+        'critic': target_critic_network.variables,
+        'policy': policy_network_to_expose.variables,
+    }
 
     self._checkpointer = tf2_savers.Checkpointer(
         time_delta_minutes=10,
@@ -140,6 +160,17 @@ class SACLearner(acme.Learner):
         *self._critic_network.variables,
         *self._policy_network.variables,
     )
+    target_variables = (
+        *self._target_observation_network.variables,
+        *self._target_critic_network.variables,
+        *self._target_policy_network.variables,
+    )
+    # Make online -> target network update ops.
+    if self._target_update_period > 0 and \
+       tf.math.mod(self._num_steps, self._target_update_period) == 0:
+      for src, dest in zip(online_variables, target_variables):
+        dest.assign(src)
+    self._num_steps.assign_add(1)
 
     # Get data from replay (dropping extras if any). Note there is no
     # extra data here because we do not insert any into Reverb.
@@ -155,12 +186,12 @@ class SACLearner(acme.Learner):
       # step effectively means that the policy and critic share observation
       # network weights.
       o_tm1 = self._observation_network(o_tm1)
-      o_t = self._observation_network(o_t)
+      o_t = self._target_observation_network(o_t)
       o_t = tree.map_structure(tf.stop_gradient, o_t)
 
       # Policy
       pol_tm1, v_tm1 = self._policy_network(o_tm1)
-      pol_t, v_t = self._policy_network(o_t) # already "squozen"
+      pol_t, v_t = self._target_policy_network(o_t)
       pol_t = tree.map_structure(tf.stop_gradient, pol_t)
       v_t = tree.map_structure(tf.stop_gradient, v_t)
       #v_t = tree.map_structure(tf.stop_gradient, v_t)
@@ -198,13 +229,13 @@ class SACLearner(acme.Learner):
       q_tm1 = tf.squeeze(q_tm1, axis=-1)  # [B]
 
       onpol_a_t = self._sampling_head(pol_t)
-      onpol_q_t = self._critic_network(o_t, onpol_a_t)
+      onpol_q_t = self._target_critic_network(o_t, onpol_a_t)
       onpol_q_t = tf.squeeze(onpol_q_t, axis=-1)  # [B]
       onpol_q_t = tree.map_structure(tf.stop_gradient, onpol_q_t)
 
       scaled_r_t = self._observation_network.scale_rewards(r_t)
       #tf.print('scaled_r_t ', scaled_r_t)
-      critic_target = tf.stop_gradient(r_t + d_t * tf.minimum(v_t, onpol_q_t))
+      critic_target = tf.stop_gradient(scaled_r_t + d_t * tf.minimum(v_t, onpol_q_t))
       #critic_target = tf.stop_gradient(scaled_r_t + d_t * 0.5*(v_t + onpol_q_t))
       #critic_loss = #tf.nn.compute_average_loss(
       critic_loss = losses.huber(critic_target - q_tm1, 1.0)
