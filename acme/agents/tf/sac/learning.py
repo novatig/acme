@@ -25,6 +25,8 @@ from acme.tf import savers as tf2_savers
 from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.utils import loggers
+from acme.agents.tf.sac import model
+
 import numpy as np
 import sonnet as snt
 import tensorflow as tf
@@ -33,20 +35,6 @@ import tree
 import trfl
 
 tfd = tfp.distributions
-
-'''
-def SAC_losses(q_t:     tf.Tensor,
-               v_t:     tf.Tensor,
-               log_prob_t:     tf.Tensor,
-               r_t:     tf.Tensor,
-               gamma_t: tf.Tensor,
-               v_tp1:   tf.Tensor,
-               entropy_coeff: float) -> tf.Tensor:
-  # Recover linear action from environment action
-  squashed_a_t = 2 * (a_t - self._offset)/self._scale - 1 # [-1, 1]
-  linear_a_t = tf.atanh(squashed_a_t)
-  log_probs = self._distribution.log_prob(samples)
-'''
 
 class SACLearner(acme.Learner):
   """SAC learner.
@@ -64,10 +52,11 @@ class SACLearner(acme.Learner):
       target_critic_network: snt.Module,
       discount: float,
       target_update_period: int,
+      learning_rate: float,
       entropy_coeff: float,
       dataset: tf.data.Dataset,
-      observation_network: types.TensorTransformation = lambda x: x,
-      target_observation_network: types.TensorTransformation = lambda x: x,
+      observation_network: types.TensorTransformation,
+      target_observation_network: types.TensorTransformation,
       policy_optimizer: snt.Optimizer = None,
       critic_optimizer: snt.Optimizer = None,
       clipping: bool = False,
@@ -100,10 +89,8 @@ class SACLearner(acme.Learner):
     self._target_critic_network = target_critic_network
     self._sampling_head = sampling_head
 
-    # Make sure observation networks are snt.Module's so they have variables.
-    self._observation_network = tf2_utils.to_sonnet_module(observation_network)
-    self._target_observation_network = tf2_utils.to_sonnet_module(
-        target_observation_network)
+    self._observation_network = observation_network
+    self._target_observation_network = target_observation_network
 
     # General learner book-keeping and loggers.
     self._counter = counter or counting.Counter()
@@ -113,6 +100,9 @@ class SACLearner(acme.Learner):
     self._discount = discount
     self._clipping = clipping
     self._entropy_coeff = entropy_coeff
+    self._learning_rate = learning_rate
+
+    self._ReFER = model.ReFER_module()
 
     # Necessary to track when to update target networks.
     self._num_steps = tf.Variable(0, dtype=tf.int32)
@@ -125,14 +115,14 @@ class SACLearner(acme.Learner):
     # Create optimizers if they aren't given.
     self._policy_optimizer = policy_optimizer or snt.optimizers.Adam(1e-4)
     self._critic_optimizer = critic_optimizer or snt.optimizers.Adam(1e-4)
+    self._ReFER_optimizer = snt.optimizers.SGD(1e-3)
 
-    # Expose the variables.
-    policy_network_to_expose = snt.Sequential(
-        [self._target_observation_network, self._target_policy_network])
-    self._variables = {
-        'critic': target_critic_network.variables,
-        'policy': policy_network_to_expose.variables,
-    }
+    # Get trainable variables.
+    # Here we train the preprocessing variables along with the policy.
+    self._policy_variables = (
+      self._observation_network.trainable_variables +
+      self._policy_network.trainable_variables)
+    self._critic_variables = self._critic_network.trainable_variables
 
     self._checkpointer = tf2_savers.Checkpointer(
         time_delta_minutes=10,
@@ -141,6 +131,7 @@ class SACLearner(acme.Learner):
             'policy': self._policy_network,
             'critic': self._critic_network,
             'encoder': self._observation_network,
+            'ReFER': self._ReFER,
             'policy_optimizer': self._policy_optimizer,
             'critic_optimizer': self._critic_optimizer,
         },
@@ -175,7 +166,9 @@ class SACLearner(acme.Learner):
     # Get data from replay (dropping extras if any). Note there is no
     # extra data here because we do not insert any into Reverb.
     inputs = next(self._iterator)
-    o_tm1, a_tm1, r_t, d_t, o_t = inputs.data
+    o_tm1, a_tm1, r_t, d_t, o_t, extra = inputs.data
+    behavior_logP_tm1 = extra['logP']
+    behavior_tm1 = extra['policy']
 
     # Cast the additional discount to match the environment discount dtype.
     discount = tf.cast(self._discount, dtype=d_t.dtype)
@@ -194,13 +187,18 @@ class SACLearner(acme.Learner):
       pol_t, v_t = self._target_policy_network(o_t)
       pol_t = tree.map_structure(tf.stop_gradient, pol_t)
       v_t = tree.map_structure(tf.stop_gradient, v_t)
-      #v_t = tree.map_structure(tf.stop_gradient, v_t)
 
+      # Actor loss. If clipping is true use dqda clipping and clip the norm.
+      # TODO: two critic nets, e.g. q1_tm1 and q2_tm1, pick the min as target
       # DPG loss. If clipping is true use dqda clipping and clip the norm.
       dqda_clipping = 1.0 if self._clipping else None
-      onpol_a_tm1 = self._sampling_head(pol_tm1)
+      onpol_a_tm1, onpol_logP_tm1 = self._sampling_head(pol_tm1)
       onpol_q_tm1 = self._critic_network(o_tm1, onpol_a_tm1)
       onpol_q_tm1 = tf.squeeze(onpol_q_tm1, axis=-1)  # [B]
+
+      logP_tm1 = self._sampling_head.log_prob(a_tm1, pol_tm1)
+      ReFER_params_loss = self._ReFER.loss(behavior_logP_tm1, logP_tm1)
+
       dpg_loss = losses.dpg(
           onpol_q_tm1,
           onpol_a_tm1,
@@ -208,56 +206,48 @@ class SACLearner(acme.Learner):
           dqda_clipping=dqda_clipping,
           clip_norm=self._clipping)
       dpg_loss = tf.reduce_mean(dpg_loss, axis=0)
-      #tf.print('dpg_loss ', tf.shape(dpg_loss))
+      entropy_loss = self._entropy_coeff * tf.reduce_mean(onpol_logP_tm1,axis=0)
 
-      # Actor loss. If clipping is true use dqda clipping and clip the norm.
-      # TODO: two critic nets, e.g. q1_tm1 and q2_tm1, pick the min as target
-      logP_tm1 = self._sampling_head.log_prob(onpol_a_tm1, pol_tm1)
-      entropy_loss = self._entropy_coeff * tf.reduce_mean(logP_tm1, axis=0)
+      KL_coef = self._ReFER.DKL_coef()
+      #behavior_P_tm1 = tf.math.exp(behavior_logP_tm1)
+      #KL_loss = KL_coef * behavior_P_tm1 * (behavior_logP_tm1 - logP_tm1)
+      KL_loss = tf.reduce_sum((behavior_tm1 - pol_tm1) ** 2, axis=-1)
+      KL_loss = KL_coef * tf.reduce_mean(KL_loss, axis=0)
 
       # V(s) loss
-      value_target = tf.stop_gradient(onpol_q_tm1 -self._entropy_coeff*logP_tm1)
-      #value_loss = tf.nn.compute_average_loss(
-      #tf.print('onpol_q_tm1 ', tf.shape(onpol_q_tm1))
-      #tf.print('v_tm1 ', tf.shape(v_tm1))
+      value_target = tf.stop_gradient(
+        onpol_q_tm1 - self._entropy_coeff * onpol_logP_tm1)
+
       value_loss = losses.huber(value_target - v_tm1, 1.0)
-      #tf.print('value_loss ', tf.shape(value_loss))
+      #value_loss = 0.5 * (value_target - v_tm1) ** 2
       value_loss = tf.reduce_mean(value_loss, axis=0)
 
       # Critic learning with TD loss
       q_tm1 = self._critic_network(o_tm1, a_tm1)
       q_tm1 = tf.squeeze(q_tm1, axis=-1)  # [B]
 
-      onpol_a_t = self._sampling_head(pol_t)
+      onpol_a_t, logP_t = self._sampling_head(pol_t)
       onpol_q_t = self._target_critic_network(o_t, onpol_a_t)
       onpol_q_t = tf.squeeze(onpol_q_t, axis=-1)  # [B]
       onpol_q_t = tree.map_structure(tf.stop_gradient, onpol_q_t)
 
-      scaled_r_t = self._observation_network.scale_rewards(r_t)
-      #tf.print('scaled_r_t ', scaled_r_t)
-      critic_target = tf.stop_gradient(scaled_r_t + d_t * tf.minimum(v_t, onpol_q_t))
-      #critic_target = tf.stop_gradient(scaled_r_t + d_t * 0.5*(v_t + onpol_q_t))
-      #critic_loss = #tf.nn.compute_average_loss(
+      R_t = self._observation_network.scale_rewards(r_t)
+      critic_target = tf.stop_gradient(R_t + d_t * tf.minimum(v_t, onpol_q_t))
+      #critic_target = tf.stop_gradient(R_t + d_t * 0.5*(v_t + onpol_q_t))
+
       critic_loss = losses.huber(critic_target - q_tm1, 1.0)
-      #tf.print('critic_loss ', tf.shape(critic_loss))
+      #critic_loss = 0.5 * (critic_target - q_tm1) ** 2
       critic_loss = tf.reduce_mean(critic_loss, axis=0)
 
       encoder_loss = self._observation_network.compute_loss(o_tm1, r_t)
 
-      policy_loss = value_loss + entropy_loss + dpg_loss + encoder_loss
-      #tf.print('policy_loss ', tf.shape(policy_loss))
-      #tf.print('critic_loss ', tf.shape(critic_loss))
-
-    # Get trainable variables.
-    # Here we train the preprocessing variables along with the policy.
-    policy_variables = (
-      self._observation_network.trainable_variables +
-      self._policy_network.trainable_variables)
-    critic_variables = self._critic_network.trainable_variables
+      policy_loss = value_loss +entropy_loss +dpg_loss +encoder_loss +KL_loss
 
     # Compute gradients.
-    policy_gradients = tape.gradient(policy_loss, policy_variables)
-    critic_gradients = tape.gradient(critic_loss, critic_variables)
+    policy_gradients = tape.gradient(policy_loss, self._policy_variables)
+    critic_gradients = tape.gradient(critic_loss, self._critic_variables)
+    ReFER_gradient = tape.gradient(
+      ReFER_params_loss, self._ReFER.trainable_variables)
 
     # Delete the tape manually because of the persistent=True flag.
     del tape
@@ -268,10 +258,10 @@ class SACLearner(acme.Learner):
       critic_gradients = tf.clip_by_global_norm(critic_gradients, 40.)[0]
 
     # Apply gradients.
-    self._policy_optimizer.apply(policy_gradients, policy_variables)
-    self._critic_optimizer.apply(critic_gradients, critic_variables)
-    #tf.print(self._observation_network._obs_mean)
-    #tf.print(self._observation_network._obs_scale)
+    self._policy_optimizer.apply(policy_gradients, self._policy_variables)
+    self._critic_optimizer.apply(critic_gradients, self._critic_variables)
+    self._ReFER_optimizer.apply(ReFER_gradient, self._ReFER.trainable_variables)
+
     # Losses to track.
     return {
         'critic_loss': critic_loss,
@@ -279,6 +269,11 @@ class SACLearner(acme.Learner):
         'entropy_loss': entropy_loss,
         'dpg_loss': dpg_loss,
         'avg_q': tf.reduce_mean(onpol_q_t, axis=0),
+        'KL_loss': KL_loss,
+        #'frac_off_pol': self._ReFER._last_frac_off_pol,
+        'beta': self._ReFER._beta,
+        'r_mean': self._observation_network._ret_mean,
+        'r_scale': self._observation_network._ret_scale,
     }
 
   def step(self):

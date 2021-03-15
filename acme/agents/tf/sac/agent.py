@@ -30,6 +30,7 @@ from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.utils import loggers
 import reverb
+import numpy as np
 import sonnet as snt
 import tensorflow as tf
 
@@ -46,13 +47,15 @@ class SAC(agent.Agent):
                environment_spec: specs.EnvironmentSpec,
                policy_network: snt.Module,
                critic_network: snt.Module,
-               observation_network: types.TensorTransformation = tf.identity,
-               entropy_coeff: float = 0.2,
+               encoder_network: types.TensorTransformation = tf.identity,
+               entropy_coeff: float = 0.01,
                target_update_period: int = 0,
                discount: float = 0.99,
                batch_size: int = 256,
+               policy_learn_rate: float = 3e-4,
+               critic_learn_rate: float = 5e-4,
                prefetch_size: int = 4,
-               min_replay_size: int = 10000,
+               min_replay_size: int = 1000,
                max_replay_size: int = 250000,
                samples_per_insert: float = 64.0,
                n_step: int = 5,
@@ -89,13 +92,21 @@ class SAC(agent.Agent):
     """
     # Create a replay server to add data to. This uses no limiter behavior in
     # order to allow the Agent interface to handle it.
+
+    dim_actions = np.prod(environment_spec.actions.shape, dtype=int)
+    extra_spec = {  'logP': tf.ones(shape=(1), dtype=tf.float32),
+                  'policy': tf.ones(shape=(1, dim_actions), dtype=tf.float32)}
+    # Remove batch dimensions.
+    extra_spec = tf2_utils.squeeze_batch_dim(extra_spec)
+
     replay_table = reverb.Table(
         name=replay_table_name,
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
         max_size=max_replay_size,
         rate_limiter=reverb.rate_limiters.MinSize(1),
-        signature=adders.NStepTransitionAdder.signature(environment_spec))
+        signature=adders.NStepTransitionAdder.signature(
+          environment_spec, extras_spec=extra_spec))
     self._server = reverb.Server([replay_table], port=None)
 
     # The adder is used to insert observations into replay.
@@ -114,7 +125,7 @@ class SAC(agent.Agent):
         prefetch_size=prefetch_size)
 
     # Make sure observation network is a Sonnet Module.
-    observation_network = tf2_utils.to_sonnet_module(observation_network)
+    observation_network = model.MDPNormalization(environment_spec, encoder_network)
 
     # Get observation and action specs.
     act_spec = environment_spec.actions
@@ -122,7 +133,7 @@ class SAC(agent.Agent):
 
     # Create the behavior policy.
     sampling_head = model.SquashedGaussianSamplingHead(act_spec, sigma)
-    behavior_network = model.PolicyValueBehaviorNet(
+    self._behavior_network = model.PolicyValueBehaviorNet(
       snt.Sequential([observation_network, policy_network]), sampling_head)
 
     # Create variables.
@@ -131,7 +142,7 @@ class SAC(agent.Agent):
     tf2_utils.create_variables(critic_network, [emb_spec, act_spec])
 
     # Create the actor which defines how we take actions.
-    actor = actors.FeedForwardActor(behavior_network, adder=adder)
+    actor = model.SACFeedForwardActor(self._behavior_network, adder)
 
     if target_update_period > 0:
       target_policy_network = copy.deepcopy(policy_network)
@@ -147,8 +158,8 @@ class SAC(agent.Agent):
       target_observation_network = observation_network
 
     # Create optimizers.
-    policy_optimizer = snt.optimizers.Adam(learning_rate=1e-4)
-    critic_optimizer = snt.optimizers.Adam(learning_rate=1e-4)
+    policy_optimizer = snt.optimizers.Adam(learning_rate=policy_learn_rate)
+    critic_optimizer = snt.optimizers.Adam(learning_rate=critic_learn_rate)
 
     # The learner updates the parameters (and initializes them).
     learner = learning.SACLearner(
@@ -162,6 +173,7 @@ class SAC(agent.Agent):
         policy_optimizer=policy_optimizer,
         critic_optimizer=critic_optimizer,
         target_update_period=target_update_period,
+        learning_rate=policy_learn_rate,
         clipping=clipping,
         entropy_coeff=entropy_coeff,
         discount=discount,
@@ -176,3 +188,7 @@ class SAC(agent.Agent):
         learner=learner,
         min_observations=max(batch_size, min_replay_size),
         observations_per_step=float(batch_size) / samples_per_insert)
+
+  @property
+  def behavior_network(self):
+    return self._behavior_network

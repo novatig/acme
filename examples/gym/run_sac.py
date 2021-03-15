@@ -28,8 +28,10 @@ from acme.agents.tf import actors
 from acme.agents.tf import sac
 from acme.tf import networks
 from acme.tf import utils as tf2_utils
+
 import numpy as np
 import sonnet as snt
+import tensorflow as tf
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('task_name', 'Walker2d-v3',
@@ -85,7 +87,7 @@ def make_networks(
   num_dimensions = np.prod(environment_spec.actions.shape, dtype=int)
 
   # Create the shared observation network; here simply a state-less operation.
-  observation_network = sac.model.MDPNormalization(environment_spec)
+  observation_network = tf.identity
 
   # Create the policy network.
   policy_network = snt.Sequential([
@@ -119,7 +121,7 @@ def main(_):
       environment_spec=environment_spec,
       policy_network=agent_networks['policy'],
       critic_network=agent_networks['critic'],
-      observation_network=agent_networks['observation'],
+      encoder_network=agent_networks['observation'],
       #sigma=0.3,  # pytype: disable=wrong-arg-types
   )
 
@@ -127,14 +129,11 @@ def main(_):
   train_loop = acme.EnvironmentLoop(environment, agent, label='train_loop')
 
   # Create the evaluation policy.
-  eval_policy = snt.Sequential([
-      agent_networks['observation'],
-      agent_networks['policy'],
-  ])
+  eval_policy = agent.behavior_network
 
   # Create the evaluation actor and loop.
   eval_actor = actors.FeedForwardActor(policy_network=eval_policy)
-  eval_env = make_environment()
+  eval_env = make_environment(FLAGS.task_name)
   eval_loop = acme.EnvironmentLoop(eval_env, eval_actor, label='eval_loop')
 
   for _ in range(FLAGS.num_episodes // FLAGS.num_episodes_per_eval):
